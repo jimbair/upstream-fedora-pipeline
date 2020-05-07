@@ -1,7 +1,4 @@
-#!/usr/bin/sh
-
-set -xeuo pipefail
-
+#!/bin/bash
 # A shell script that pulls the latest Fedora cloud build
 # and uses virt-customize to inject rpms into it. It
 # outputs a new qcow2 image for you to use.
@@ -12,15 +9,18 @@ if [ ${CURRENTDIR} == "/" ] ; then
     cd /home
     CURRENTDIR=/home
 fi
+
+# Save logs for troubleshooting
 mkdir -p ${CURRENTDIR}/logs
+LOG=${CURRENTDIR}/logs/console.log
 
-# Start libvirtd
-mkdir -p /var/run/libvirt
-libvirtd &
-sleep 5
-virtlogd &
-
-chmod 666 /dev/kvm
+# This allows us to send full the debug output to our ${LOG}
+# without giving end users an over abundance of info.
+#
+# This requires bash to work
+exec 19>>${LOG}
+BASH_XTRACEFD=19
+set -xeuo pipefail
 
 namespace=${namespace:-"rpms"}
 
@@ -28,19 +28,46 @@ if [ $branch != "rawhide" ]; then
     branch=${branch:1}
 fi
 
+# Fetch our cloud image
+# cURL used for a single file on Jenkins; wget for globbing out of the archives
+echo "INFO: Fetching cloud image for Fedora ${branch}" | tee -a ${LOG}
+JENKINS_URL='https://jenkins-continuous-infra.apps.ci.centos.org/job'
+ARCHIVE_URL="https://archives.fedoraproject.org/pub/archive/fedora/linux/releases/${branch}"
+CURL_OPTS='--connect-timeout 5 --retry 5 --retry-delay 0 --retry-max-time 60 -L -k -O'
+WGET_OPTS="--retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries 5 --quiet -r --no-parent -A 'Fedora-Cloud-Base*.qcow2'"
+
+# Rawhide
 if [ "${branch}" == "rawhide" ]; then
-    curl --connect-timeout 5 --retry 5 --retry-delay 0 --retry-max-time 60 \
-         -L -k -O "https://jenkins-continuous-infra.apps.ci.centos.org/job/fedora-rawhide-image-test/lastSuccessfulBuild/artifact/Fedora-Rawhide.qcow2"
+    FETCH_CMD="curl ${CURL_OPTS} ${JENKINS_URL}/fedora-rawhide-image-test/lastSuccessfulBuild/artifact/Fedora-Rawhide.qcow2"
     DOWNLOADED_IMAGE_LOCATION="$(pwd)/Fedora-Rawhide.qcow2"
-elif [ "${branch}" -ge 28 ]; then
-    curl --connect-timeout 5 --retry 5 --retry-delay 0 --retry-max-time 60 \
-         -L -k -O "https://jenkins-continuous-infra.apps.ci.centos.org/job/fedora-f${branch}-image-test/lastSuccessfulBuild/artifact/Fedora-${branch}.qcow2"
+# Images still on Jenkins; current fc30+
+elif [ "${branch}" -ge 30 ]; then
+    FETCH_CMD="curl ${CURL_OPTS} ${JENKINS_URL}/fedora-f${branch}-image-test/lastSuccessfulBuild/artifact/Fedora-${branch}.qcow2"
     DOWNLOADED_IMAGE_LOCATION="$(pwd)/Fedora-${branch}.qcow2"
+# Archived images with 'Cloud' folder; 28,29
+# Note: 22 and 23 have the same path with Images (capital I) and two qcow images
+elif [ "${branch}" -ge 28 ]; then
+    FETCH_CMD="wget ${WGET_OPTS} ${ARCHIVE_URL}/Cloud/x86_64/images/"
+    DOWNLOADED_IMAGE_LOCATION=$(pwd)/$(find archives.fedoraproject.org -name "*.qcow2" | head -1)
+# Archived images with 'CloudImages' Folder; fc24-27
+elif [ "${branch}" -ge 24 ]; then
+    FETCH_CMD="wget ${WGET_OPTS} ${ARCHIVE_URL}/CloudImages/x86_64/images/"
+    DOWNLOADED_IMAGE_LOCATION=$(pwd)/$(find archives.fedoraproject.org -name "*.qcow2" | head -1)
+# FC1-23 - safe to skip as they're EOL
 else
-    INSTALL_URL="https://dl.fedoraproject.org/pub/fedora/linux/releases/${branch}/CloudImages/x86_64/images/"
-    wget --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries 5 --quiet -r --no-parent -A 'Fedora-Cloud-Base*.qcow2' ${INSTALL_URL}
-    DOWNLOADED_IMAGE_LOCATION=$(pwd)/$(find dl.fedoraproject.org -name "*.qcow2" | head -1)
+    echo "ERROR: Unable to find cloud image for Fedora ${branch} - Exiting."
+    exit 1
 fi
+
+# Fetch our file and validate it ran successfully
+${FETCH_CMD} >> ${LOG} 2>&1
+if [ $? -ne 0 ]; then
+    echo "ERROR: Unable to fetch cloud image for Fedora ${branch}"
+    echo "Fetch command: ${FETCH_CMD}" | tee -a ${LOG}
+    exit 1
+fi
+
+echo "INFO: Successfully fetch cloud image for Fedora ${branch}"
 
 function clean_up {
   set +e
